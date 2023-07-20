@@ -1,0 +1,380 @@
+version: '3.7'
+
+volumes:
+  dataeng-mongodb-volume:
+    name: "dataeng-mongodb-volume"
+    driver: local
+  dataeng-postgres-volume:
+    name: "dataeng-postgres-volume"
+    driver: local
+  dataeng-airflow-postgres-volume:
+    name: "dataeng-airflow-postgres-volume"
+    driver: local
+
+networks:
+  dataeng-pipelines:
+      name: dataeng-pipelines
+      driver: bridge
+      ipam:
+          driver: default
+          config:
+              - subnet: "172.18.0.0/16"
+                gateway: "172.18.0.1"
+
+# Settings and configurations that are common for all minio containers
+x-minio-common: &minio-common
+  image: minio/minio:RELEASE.2023-02-22T18-23-45Z
+  command: server --console-address ":9001" http://minio{1...4}/data{1...2}
+  expose:
+    - "9000"
+    - "9001"
+  environment:
+    MINIO_ROOT_USER: minioadmin
+    MINIO_ROOT_PASSWORD: minioadmin
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+    interval: 30s
+    timeout: 20s
+    retries: 3
+
+# Settings dna configuration for apache-airflow
+x-dataeng-airflow-common: &dataeng-airflow-common
+  build: 
+    dockerfile: ./data/airflow/Dockerfile
+  user: "${AIRFLOW_UID}:0"
+  env_file:
+    - ./main.env
+    - ./data/airflow/.env
+  volumes:
+    - ./data/airflow/dags:/opt/airflow/dags
+    - ./data/airflow/logs:/opt/airflow/logs
+    - ./data/airflow/spark_jars:/opt/airflow/spark_jars
+    - ./data/airflow/downloads:/opt/airflow/downloads
+    - ./data/airflow/plugins:/opt/airflow/plugins
+    - /var/run/docker.sock:/var/run/docker.sock
+
+x-dataeng-airflow-depends-on: &dataeng-airflow-depends-on
+  depends_on:
+    dataeng-airflow-postgres:
+      condition: service_healthy
+    dataeng-airflow-init:
+      condition: service_completed_successfully
+
+# starts 4 docker containers running minio server instances.
+# using nginx reverse proxy, load balancing, you can access
+# it through port 9000.
+services:
+  minio1:
+    <<: *minio-common
+    container_name: minio1
+    hostname: minio1
+    volumes:
+      - ./volumes/minio/data1-1:/data1
+      - ./volumes/minio/data1-2:/data2
+    networks:
+      dataeng-pipelines:
+        ipv4_address: 172.18.0.16
+
+  minio2:
+    <<: *minio-common
+    container_name: minio2
+    hostname: minio2
+    volumes:
+      - ./volumes/minio/data2-1:/data1
+      - ./volumes/minio/data2-2:/data2
+    networks:
+      dataeng-pipelines:
+        ipv4_address: 172.18.0.17
+
+  minio3:
+    <<: *minio-common
+    container_name: minio3
+    hostname: minio3
+    volumes:
+      - ./volumes/minio/data3-1:/data1
+      - ./volumes/minio/data3-2:/data2
+    networks:
+      dataeng-pipelines:
+        ipv4_address: 172.18.0.18
+
+  minio4:
+    <<: *minio-common
+    container_name: minio4
+    hostname: minio4
+    volumes:
+      - ./volumes/minio/data4-1:/data1
+      - ./volumes/minio/data4-2:/data2
+    networks:
+      dataeng-pipelines:
+        ipv4_address: 172.18.0.19
+
+  dataeng-minio-nginx:
+    image: nginx:1.19.2-alpine
+    container_name: dataeng-minio-nginx
+    hostname: dataeng-nginx
+    volumes:
+      - ./data/minio/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    depends_on:
+      - minio1
+      - minio2
+      - minio3
+      - minio4
+    networks:
+      dataeng-pipelines:
+        ipv4_address: 172.18.0.20
+
+  dataeng-localstack:
+    container_name: dataeng-localstack
+    image: localstack/localstack:latest
+    ports:
+      - '4566:4566' # LocalStack endpoint
+      - '4510-4559:4510-4559' # external services port range
+    env_file:
+      - ./main.env
+    environment:
+      - SERVICES=s3
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    volumes:
+      # - ./data/localstack/localstack-script.sh:/etc/localstack/init/ready.d/script.sh
+      - '/var/run/docker.sock:/var/run/docker.sock'
+      - '/var/lib/localstack:/var/lib/localstack'
+    networks:
+      dataeng-pipelines:
+        ipv4_address: 172.18.0.30
+
+  dataeng-aws-cli:
+    image: mesosphere/aws-cli
+    container_name: "dataeng-aws-cli"
+    volumes:
+      - ./data/localstack/resources:/tmp/resources
+    environment:
+      - AWS_ACCESS_KEY_ID=dummyaccess
+      - AWS_SECRET_ACCESS_KEY=dummysecret
+      - AWS_DEFAULT_REGION=sa-east-1
+    entrypoint: /bin/sh -c
+    command: >
+      "
+        aws --endpoint http://dataeng-localstack:4566 s3 mb s3://dataeng-imdb
+        aws --endpoint http://dataeng-localstack:4566 s3 cp /tmp/resources/fake-file.json s3://dataeng-imdb/fake-file.json
+      "
+    depends_on:
+      -  dataeng-localstack
+    networks:
+      dataeng-pipelines:
+        ipv4_address: 172.18.0.31
+        
+  dataeng-mongodb:
+    image: mongo:latest
+    container_name: dataeng-mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: rootpassword
+    ports:
+      - 27017:27017
+    volumes:
+      - dataeng-mongodb-volume:/data/db
+    networks:
+      dataeng-pipelines:
+        ipv4_address: 172.18.0.22
+
+  # Airflow Services
+  dataeng-airflow-postgres:
+    image: postgres:latest
+    container_name: dataeng-airflow-postgres
+    ports:
+      - "5434:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
+    env_file:
+      - ./data/airflow/.env
+    volumes:
+      - dataeng-airflow-postgres-volume:/var/lib/postgresql/data
+    networks:
+      dataeng-pipelines:
+        ipv4_address: 172.18.0.110
+
+  dataeng-airflow-scheduler:
+    <<: [*dataeng-airflow-common, *dataeng-airflow-depends-on]
+    container_name: dataeng-airflow-scheduler
+    command: scheduler
+    restart: on-failure
+    ports:
+      - "8793:8793"
+    networks:
+      dataeng-pipelines:
+        ipv4_address: 172.18.0.111
+
+  dataeng-airflow-webserver:
+    <<: [*dataeng-airflow-common, *dataeng-airflow-depends-on]
+    container_name: dataeng-airflow-webserver
+    restart: always
+    command: webserver
+    ports:
+      - "8079:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8079/health"]
+      interval: 30s
+      timeout: 30s
+      retries: 5
+    networks:
+        dataeng-pipelines:
+          ipv4_address: 172.18.0.112
+  
+  dataeng-airflow-init:
+    <<: *dataeng-airflow-common
+    container_name: dataeng-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /sources/logs /sources/dags /sources/plugins /sources/downloads
+        chmod 777 -R /sources/downloads
+        chown -R "${AIRFLOW_UID}:0" /sources/{logs,dags,plugins,downloads}
+        cp /opt/airflow/spark_jars_tmp/* /opt/airflow/spark_jars
+        exec /entrypoint airflow version
+    networks:
+      - dataeng-pipelines
+
+  # Postgreql Service
+  dataeng-postgres:
+    image: postgres:15.2-alpine3.17
+    container_name: dataeng-postgres
+    ports:
+      - "5431:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 5s
+      retries: 5
+    env_file:
+      - ./data/postgresql/.env
+    volumes:
+      - dataeng-postgres-volume:/var/lib/postgresql/data
+      - ./data/postgresql/create-multiple-postgresql-databases.sh:/docker-entrypoint-initdb.d/01-create-db.sh
+    networks:
+      dataeng-pipelines:
+        ipv4_address: 172.18.0.6
+
+  #Metabase Service
+  dataeng-metabase-app:
+    image: metabase/metabase:v0.45.3
+    container_name: dataeng-metabase-app
+    restart: always
+    ports:
+      - 3001:3000
+    volumes:
+      # declare your mount volume /host/dir:/container/dir
+      - ./data/metabase/data:/metabase-data
+    env_file:
+      - ./main.env
+      - ./data/metabase/.env
+    depends_on:
+      - dataeng-postgres
+    links:
+      - dataeng-postgres
+    networks:
+      dataeng-pipelines:
+        ipv4_address: 172.18.0.25
+
+  # # Jupyter Lab Service
+  dataeng-jupyterlab:
+    container_name: dataeng-jupyterlab
+    build:
+      dockerfile: ./data/jupyterlab-clean/Dockerfile
+    volumes:
+     - ./jupyter-notebooks/:/notebooks
+    ports:
+      - "8888:8888"
+      - "20020:20020"
+    env_file:
+      - ./main.env
+    environment:
+      - JUPYTER_ENABLE_LAB=0
+    command: start-notebook.sh --NotebookApp.notebook_dir=/notebooks --NotebookApp.token='jupyter' --NotebookApp.password='jupyter'
+    networks:
+      dataeng-pipelines:
+        ipv4_address: 172.18.0.10
+
+  # Spark System
+  dataeng-spark-master:
+    build:
+      context: .
+      dockerfile: ./data/spark/Dockerfile
+    container_name: dataeng-spark-master
+    ports:
+      - "9090:8080"
+      - "7077:7077"
+      - "4040:4040"
+      - "6066:6066"
+    env_file:
+      - ./main.env
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    networks:
+      dataeng-pipelines:
+        ipv4_address: 172.18.0.80
+  dataeng-spark-worker-a:
+    build:
+      context: .
+      dockerfile: ./data/spark/Dockerfile
+    container_name: dataeng-spark-worker-a
+    ports:
+      - "9091:8080"
+      - "7002:7000"
+      - "4041:4040"
+    depends_on:
+      - dataeng-spark-master
+    env_file:
+      - ./main.env
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://dataeng-spark-master:7077
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=1
+      - SPARK_LOCAL_IP=dataeng-spark-worker-a
+      - SPARK_LOCAL_HOST=dataeng-spark-worker-a
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    networks:
+      dataeng-pipelines:
+        ipv4_address: 172.18.0.81
+    volumes:
+      # declare your mount volume /host/dir:/container/dir
+      - ./data/spark/data:/opt/bitnami/spark/jars2
+  dataeng-spark-worker-b:
+    build:
+      context: .
+      dockerfile: ./data/spark/Dockerfile
+    container_name: dataeng-spark-worker-b
+    ports:
+      - "9092:8080"
+      - "7003:7000"
+      - "4042:4040"
+    depends_on:
+      - dataeng-spark-master
+    env_file:
+      - ./main.env
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://dataeng-spark-master:7077
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=1
+      - SPARK_LOCAL_IP=dataeng-spark-worker-b
+      - SPARK_LOCAL_HOST=dataeng-spark-worker-b
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    networks:
+      dataeng-pipelines:
+        ipv4_address: 172.18.0.82
