@@ -312,6 +312,8 @@ services:
       - "6066:6066"
     env_file:
       - ./main.env
+    volumes:
+      - ./data/spark/custom_data/:/opt/bitnami/spark/custom_data
     environment:
       - SPARK_MODE=master
       - SPARK_RPC_AUTHENTICATION_ENABLED=no
